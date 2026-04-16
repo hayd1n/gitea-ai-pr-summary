@@ -1,0 +1,23 @@
+{
+  "name": "gitea-ai-pr-summary",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@fastify/type-provider-typebox": "^6.1.0",
+    "@google/genai": "^1.50.1",
+    "@sinclair/typebox": "^0.34.49",
+    "fastify": "^5.8.4",
+    "gitea-js": "^1.23.0"
+  }
+}

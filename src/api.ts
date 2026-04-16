@@ -1,0 +1,352 @@
+import type { FastifyPluginAsync } from "fastify";
+import type { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
+import { Type } from "@sinclair/typebox";
+import crypto from "crypto";
+import {
+  createOrUpdateExistingComment as createOrUpdateExistingIssueComment,
+  createIssueComment,
+  getPRDiff,
+} from "./gitea";
+import { generatePRSummary, suggestPRTitle } from "./ai";
+import {
+  getPromptOrTemplate,
+  DEFAULT_PR_SUMMARY_PROMPT,
+  DEFAULT_PR_TITLE_SUGGESTION_PROMPT,
+  DEFAULT_PR_SUMMARY_TEMPLATE,
+  DEFAULT_PR_TITLE_SUGGESTION_TEMPLATE,
+} from "./templates";
+import { giteaApi } from "gitea-js";
+import { GoogleGenAI } from "@google/genai";
+
+export interface ApiOptions {
+  gitea: ReturnType<typeof giteaApi>;
+  gemini: GoogleGenAI;
+  geminiModel?: string;
+  enablePrSummary?: boolean;
+  enablePrTitleSuggestion?: boolean;
+  prSummaryCommentUpdateExisting?: boolean;
+  prSummartCommentPrefix?: string;
+}
+
+export const ApiOptionsDefaults = {
+  geminiModel: "gemma-4-31b-it",
+  enablePrSummary: true,
+  enablePrTitleSuggestion: true,
+  prSummaryCommentUpdateExisting: true,
+  prSummartCommentPrefix: "AI_PR_SUMMARY",
+};
+
+export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
+  fastify,
+  options
+) => {
+  const {
+    gitea,
+    gemini,
+    geminiModel = ApiOptionsDefaults.geminiModel,
+    enablePrSummary = ApiOptionsDefaults.enablePrSummary,
+    enablePrTitleSuggestion = ApiOptionsDefaults.enablePrTitleSuggestion,
+    prSummaryCommentUpdateExisting = ApiOptionsDefaults.prSummaryCommentUpdateExisting,
+    prSummartCommentPrefix = ApiOptionsDefaults.prSummartCommentPrefix,
+  } = options;
+
+  const typedFastify = fastify.withTypeProvider<TypeBoxTypeProvider>();
+
+  type TaskAction = "pr_summary" | "pr_title_suggestion";
+
+  interface PRTask {
+    taskId: string;
+    action: TaskAction;
+    triggerSource: string; // e.g., "pull_request_sync_event"
+    prIndex: number;
+    repoOwner: string;
+    repoName: string;
+    prTitle?: string;
+  }
+
+  const taskQueue: PRTask[] = [];
+  let currentProcessingTask: PRTask | null = null;
+  let isProcessingQueue = false;
+
+  async function processQueue() {
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
+
+    while (taskQueue.length > 0) {
+      const task = taskQueue.shift();
+      if (!task) continue;
+
+      currentProcessingTask = task;
+      const { taskId, action, prIndex, repoOwner, repoName } = task;
+      typedFastify.log.info(
+        { taskId, action, prIndex, repoOwner, repoName },
+        `Processing task: ${action}`
+      );
+
+      try {
+        if (action === "pr_summary") {
+          // Use a consistent prefix for the comment, optionally with a unique suffix to allow multiple comments if updates are not desired
+          let prefix = prSummartCommentPrefix;
+          if (!prSummaryCommentUpdateExisting) {
+            prefix += `_${crypto.randomUUID()}`;
+          }
+          prefix = `<!-- ${prefix} -->`; // HTML comment to hide the prefix in the comment body
+
+          // Create or update a comment in Gitea to indicate that the summary is being generated
+          await createOrUpdateExistingIssueComment(
+            gitea,
+            repoOwner,
+            repoName,
+            prIndex,
+            prefix,
+            "> Generating PR summary... (This may take a moment)"
+          );
+
+          const diff = await getPRDiff(gitea, repoOwner, repoName, prIndex);
+          typedFastify.log.debug({ taskId, diff }, "Fetched PR diff");
+
+          let prSummary = undefined;
+
+          // Load prompt and template dynamically
+          const summaryPrompt = await getPromptOrTemplate(
+            "pr-summary.prompt.txt",
+            DEFAULT_PR_SUMMARY_PROMPT
+          );
+          const summaryTemplate = await getPromptOrTemplate(
+            "pr-summary.template.md",
+            DEFAULT_PR_SUMMARY_TEMPLATE
+          );
+
+          try {
+            prSummary = await generatePRSummary(gemini, diff, {
+              model: geminiModel,
+              prompt: summaryPrompt,
+            });
+          } catch (error) {
+            typedFastify.log.error(
+              { taskId, error },
+              "Failed to generate PR summary"
+            );
+          }
+
+          if (!prSummary) {
+            typedFastify.log.warn(
+              { taskId },
+              "PR summary generation returned empty result"
+            );
+            prSummary =
+              "Failed to generate PR summary. Please check the logs for details.";
+          }
+
+          const finalComment = summaryTemplate
+            .replace("{{summary}}", prSummary)
+            .replace("{{date}}", new Date().toISOString())
+            .replace("{{triggerSource}}", task.triggerSource);
+
+          // Create or update the PR summary comment in Gitea
+          await createOrUpdateExistingIssueComment(
+            gitea,
+            repoOwner,
+            repoName,
+            prIndex,
+            prefix,
+            finalComment
+          );
+
+          typedFastify.log.info(
+            { taskId },
+            "PR Summary task completed successfully (Comment posted)"
+          );
+        } else if (action === "pr_title_suggestion") {
+          if (!task.prTitle) {
+            typedFastify.log.warn(
+              { taskId },
+              "Missing PR title in task, skipping suggestion"
+            );
+            continue;
+          }
+
+          const diff = await getPRDiff(gitea, repoOwner, repoName, prIndex);
+          typedFastify.log.debug(
+            { taskId, prTitle: task.prTitle, diff },
+            "Fetched diff for title suggestion"
+          );
+
+          // Load prompt and template dynamically
+          const suggestionPrompt = await getPromptOrTemplate(
+            "pr-title-suggestion.prompt.txt",
+            DEFAULT_PR_TITLE_SUGGESTION_PROMPT
+          );
+          const suggestionTemplate = await getPromptOrTemplate(
+            "pr-title-suggestion.template.md",
+            DEFAULT_PR_TITLE_SUGGESTION_TEMPLATE
+          );
+
+          let suggestion;
+          try {
+            suggestion = await suggestPRTitle(gemini, task.prTitle, diff, {
+              model: geminiModel,
+              prompt: suggestionPrompt,
+            });
+          } catch (error) {
+            typedFastify.log.error(
+              { taskId, error },
+              "Failed to generate PR title suggestion"
+            );
+          }
+
+          if (suggestion?.suggestModification) {
+            const suggestionComment = suggestionTemplate
+              .replace("{{suggestedTitle}}", suggestion.suggestedTitle)
+              .replace("{{reason}}", suggestion.reason)
+              .replace("{{date}}", new Date().toISOString())
+              .replace("{{triggerSource}}", task.triggerSource);
+
+            await createIssueComment(
+              gitea,
+              repoOwner,
+              repoName,
+              prIndex,
+              suggestionComment
+            );
+
+            typedFastify.log.info(
+              { taskId, suggestedTitle: suggestion.suggestedTitle },
+              "PR Title Suggestion task completed successfully (Comment posted)"
+            );
+          } else {
+            typedFastify.log.info(
+              { taskId },
+              "PR Title Suggestion task completed (No suggestion needed)"
+            );
+          }
+        }
+      } catch (error) {
+        typedFastify.log.error({ taskId, action, error }, "Task failed");
+      }
+
+      currentProcessingTask = null;
+    }
+
+    isProcessingQueue = false;
+  }
+
+  // Define the schema for the webhook request body
+  const WebhookBodySchema = Type.Object({
+    action: Type.Optional(Type.String()),
+    pull_request: Type.Optional(
+      Type.Object({
+        number: Type.Number(),
+        title: Type.Optional(Type.String()),
+      })
+    ),
+    repository: Type.Optional(
+      Type.Object({
+        name: Type.String(),
+        owner: Type.Optional(
+          Type.Object({
+            username: Type.String(),
+          })
+        ),
+      })
+    ),
+  });
+
+  // Define the route for handling Gitea webhooks
+  typedFastify.post(
+    "/",
+    { schema: { body: WebhookBodySchema } },
+    async function handler(request, reply) {
+      typedFastify.log.debug(request.body, "Received request");
+
+      // Handle different Gitea event types based on the "X-Gitea-Event-Type" header
+      const eventType = request.headers["x-gitea-event-type"];
+      if (
+        eventType === "pull_request_sync" ||
+        (eventType === "pull_request" && request.body?.action === "opened")
+      ) {
+        const prIndex = request.body?.pull_request?.number;
+        const prTitle = request.body?.pull_request?.title;
+        const repoOwner = request.body?.repository?.owner?.username;
+        const repoName = request.body?.repository?.name;
+        if (!prIndex || !repoOwner || !repoName) {
+          typedFastify.log.error(
+            { prIndex, repoOwner, repoName, eventType },
+            "Missing required fields in event"
+          );
+          reply.status(400).send({ error: "Missing required fields" });
+          return;
+        }
+
+        typedFastify.log.info(
+          { prIndex, prTitle, repoOwner, repoName, eventType },
+          `Received ${eventType} event`
+        );
+
+        // Enqueue tasks for processing this PR asynchronously
+        const taskIds: string[] = [];
+        const enqueuedTasks: string[] = [];
+
+        if (enablePrSummary) {
+          const summaryTaskId = crypto.randomUUID();
+          taskQueue.push({
+            taskId: summaryTaskId,
+            action: "pr_summary",
+            triggerSource: eventType,
+            prIndex,
+            repoOwner,
+            repoName,
+          });
+          taskIds.push(summaryTaskId);
+          enqueuedTasks.push("AI PR Summary");
+        }
+
+        if (enablePrTitleSuggestion) {
+          const suggestionTaskId = crypto.randomUUID();
+          taskQueue.push({
+            taskId: suggestionTaskId,
+            action: "pr_title_suggestion",
+            triggerSource: eventType,
+            prIndex,
+            repoOwner,
+            repoName,
+            prTitle,
+          });
+          taskIds.push(suggestionTaskId);
+          enqueuedTasks.push("PR Title Suggestion");
+        }
+
+        if (taskIds.length === 0) {
+          reply.status(200).send({ message: "No AI tasks enabled" });
+          return;
+        }
+
+        // Start processing queue asynchronously
+        // kick-start the queue processing without awaiting it, so we can send an immediate response
+        processQueue().catch((err) => {
+          typedFastify.log.error({ err }, "Error in processQueue loop");
+        });
+
+        // Send immediate acknowledgment back
+        reply.status(202).send({
+          taskIds,
+          status: "queued",
+          message: `Tasks registered for: ${enqueuedTasks.join(", ")}`,
+        });
+        return;
+      }
+
+      return request.body;
+    }
+  );
+
+  // Define the route for checking the task queue
+  typedFastify.get("/tasks", async function handler(request, reply) {
+    return {
+      isProcessing: isProcessingQueue,
+      currentTask: currentProcessingTask,
+      queueLength: taskQueue.length,
+      queuedTasks: taskQueue,
+    };
+  });
+};
