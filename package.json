@@ -1,8 +1,14 @@
 {
-  "name": "gitea-ai-pr-summary",
+  "name": "gitea-ai-pr-assistant",
+  "author": {
+    "name": "Hayden Chang",
+    "email": "m831718@gmail.com",
+    "url": "http://hayden.tw"
+  },
+  "license": "MIT",
+  "readme": "README.md",
   "module": "index.ts",
   "type": "module",
-  "private": true,
   "scripts": {
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts"
