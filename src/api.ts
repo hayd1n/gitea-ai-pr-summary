@@ -26,6 +26,7 @@ export interface ApiOptions {
   enablePrTitleSuggestion?: boolean;
   prSummaryCommentUpdateExisting?: boolean;
   prSummartCommentPrefix?: string;
+  prTitleSuggestionCommentPrefix?: string;
 }
 
 export const ApiOptionsDefaults = {
@@ -34,6 +35,7 @@ export const ApiOptionsDefaults = {
   enablePrTitleSuggestion: true,
   prSummaryCommentUpdateExisting: true,
   prSummartCommentPrefix: "AI_PR_SUMMARY",
+  prTitleSuggestionCommentPrefix: "AI_PR_TITLE_SUGGESTION",
 };
 
 export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
@@ -48,6 +50,7 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
     enablePrTitleSuggestion = ApiOptionsDefaults.enablePrTitleSuggestion,
     prSummaryCommentUpdateExisting = ApiOptionsDefaults.prSummaryCommentUpdateExisting,
     prSummartCommentPrefix = ApiOptionsDefaults.prSummartCommentPrefix,
+    prTitleSuggestionCommentPrefix = ApiOptionsDefaults.prTitleSuggestionCommentPrefix,
   } = options;
 
   const typedFastify = fastify.withTypeProvider<TypeBoxTypeProvider>();
@@ -196,11 +199,13 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
           }
 
           if (suggestion?.suggestModification) {
-            const suggestionComment = suggestionTemplate
-              .replace("{{suggestedTitle}}", suggestion.suggestedTitle)
-              .replace("{{reason}}", suggestion.reason)
-              .replace("{{date}}", new Date().toISOString())
-              .replace("{{triggerSource}}", task.triggerSource);
+            const suggestionComment =
+              `<!-- ${prTitleSuggestionCommentPrefix} -->\n\n` +
+              suggestionTemplate
+                .replace("{{suggestedTitle}}", suggestion.suggestedTitle)
+                .replace("{{reason}}", suggestion.reason)
+                .replace("{{date}}", new Date().toISOString())
+                .replace("{{triggerSource}}", task.triggerSource);
 
             await createIssueComment(
               gitea,
