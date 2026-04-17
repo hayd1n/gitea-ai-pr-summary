@@ -58,8 +58,9 @@ The PR Title MUST follow these conventions:
 ---
 ### PR Title Specification
 
-Format: \`<type>(<scope>): <subject>\`
+Format: \`[wip: ]<type>(<scope>): <subject>\`
 
+- **WIP Prefix**: (Optional) Allow \`wip: \` or \`WIP: \` at the very beginning of the title if the PR is a Work In Progress.
 - **Type**:
   - \`feat\`: New feature
   - \`fix\`: Bug fix
@@ -74,6 +75,7 @@ Format: \`<type>(<scope>): <subject>\`
 
 **Examples:**
 - \`feat(auth): implement jwt token generation\`
+- \`wip: feat(ips): implement IPS configuration management\`
 - \`fix(ui): adjust button padding on mobile devices\`
 - \`docs: update API documentation for v2 endpoint\`
 - \`refactor: simplify user data validation logic\`
