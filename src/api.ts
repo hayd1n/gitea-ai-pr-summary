@@ -17,6 +17,7 @@ import {
 } from "./templates";
 import { giteaApi } from "gitea-js";
 import { GoogleGenAI } from "@google/genai";
+import { filterGitDiff } from "./utils";
 
 export interface ApiOptions {
   gitea: ReturnType<typeof giteaApi>;
@@ -27,6 +28,7 @@ export interface ApiOptions {
   prSummaryCommentUpdateExisting?: boolean;
   prSummartCommentPrefix?: string;
   prTitleSuggestionCommentPrefix?: string;
+  botCommandPrefix?: string;
 }
 
 export const ApiOptionsDefaults = {
@@ -36,6 +38,7 @@ export const ApiOptionsDefaults = {
   prSummaryCommentUpdateExisting: true,
   prSummartCommentPrefix: "AI_PR_SUMMARY",
   prTitleSuggestionCommentPrefix: "AI_PR_TITLE_SUGGESTION",
+  botCommandPrefix: "@ai-bot",
 };
 
 export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
@@ -51,6 +54,7 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
     prSummaryCommentUpdateExisting = ApiOptionsDefaults.prSummaryCommentUpdateExisting,
     prSummartCommentPrefix = ApiOptionsDefaults.prSummartCommentPrefix,
     prTitleSuggestionCommentPrefix = ApiOptionsDefaults.prTitleSuggestionCommentPrefix,
+    botCommandPrefix = ApiOptionsDefaults.botCommandPrefix,
   } = options;
 
   const typedFastify = fastify.withTypeProvider<TypeBoxTypeProvider>();
@@ -65,9 +69,11 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
     repoOwner: string;
     repoName: string;
     prTitle?: string;
+    excludeFiles?: string[];
   }
 
   const taskQueue: PRTask[] = [];
+
   let currentProcessingTask: PRTask | null = null;
   let isProcessingQueue = false;
 
@@ -110,8 +116,12 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
             "> Generating PR summary... (This may take a moment)"
           );
 
-          const diff = await getPRDiff(gitea, repoOwner, repoName, prIndex);
-          typedFastify.log.debug({ taskId, diff }, "Fetched PR diff");
+          const rawDiff = await getPRDiff(gitea, repoOwner, repoName, prIndex);
+          const diff = filterGitDiff(rawDiff, task.excludeFiles);
+          typedFastify.log.debug(
+            { taskId, diffSize: diff.length },
+            "Fetched PR diff"
+          );
 
           let prSummary = undefined;
 
@@ -179,9 +189,10 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
             continue;
           }
 
-          const diff = await getPRDiff(gitea, repoOwner, repoName, prIndex);
+          const rawDiff = await getPRDiff(gitea, repoOwner, repoName, prIndex);
+          const diff = filterGitDiff(rawDiff, task.excludeFiles);
           typedFastify.log.debug(
-            { taskId, prTitle: task.prTitle, diff },
+            { taskId, prTitle: task.prTitle, diffSize: diff.length },
             "Fetched diff for title suggestion"
           );
 
@@ -255,6 +266,18 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
         title: Type.Optional(Type.String()),
       })
     ),
+    issue: Type.Optional(
+      Type.Object({
+        number: Type.Number(),
+        title: Type.Optional(Type.String()),
+        pull_request: Type.Optional(Type.Any()),
+      })
+    ),
+    comment: Type.Optional(
+      Type.Object({
+        body: Type.Optional(Type.String()),
+      })
+    ),
     repository: Type.Optional(
       Type.Object({
         name: Type.String(),
@@ -276,14 +299,26 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
 
       // Handle different Gitea event types based on the "X-Gitea-Event-Type" header
       const eventType = request.headers["x-gitea-event-type"];
-      if (
+      const isPrSyncOrOpened =
         eventType === "pull_request_sync" ||
-        (eventType === "pull_request" && request.body?.action === "opened")
-      ) {
-        const prIndex = request.body?.pull_request?.number;
-        const prTitle = request.body?.pull_request?.title;
+        (eventType === "pull_request" && request.body?.action === "opened");
+      const isPrCommentCreated =
+        (eventType === "pull_request_comment" ||
+          eventType === "issue_comment") &&
+        request.body?.action === "created" &&
+        request.body?.issue?.pull_request;
+
+      if (isPrSyncOrOpened || isPrCommentCreated) {
+        let prIndex = request.body?.pull_request?.number;
+        let prTitle = request.body?.pull_request?.title;
         const repoOwner = request.body?.repository?.owner?.username;
         const repoName = request.body?.repository?.name;
+
+        if (isPrCommentCreated) {
+          prIndex = request.body?.issue?.number;
+          prTitle = request.body?.issue?.title;
+        }
+
         if (!prIndex || !repoOwner || !repoName) {
           typedFastify.log.error(
             { prIndex, repoOwner, repoName, eventType },
@@ -291,6 +326,65 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
           );
           reply.status(400).send({ error: "Missing required fields" });
           return;
+        }
+
+        let triggerSummary = isPrSyncOrOpened ? enablePrSummary : false;
+        let triggerSuggestion = isPrSyncOrOpened
+          ? enablePrTitleSuggestion
+          : false;
+        let excludeFiles: string[] | undefined = undefined;
+
+        if (isPrCommentCreated) {
+          const commentBody = request.body?.comment?.body || "";
+          let commanded = false;
+
+          const escapedPrefix = botCommandPrefix.replace(
+            /[.*+?^${}()|[\]\\]/g,
+            "\\$&"
+          );
+          const summaryRegex = new RegExp(
+            `${escapedPrefix}\\s+\\/summary(?:\\s+(.*))?`,
+            "i"
+          );
+          const suggestRegex = new RegExp(
+            `${escapedPrefix}\\s+\\/suggest-title(?:\\s+(.*))?`,
+            "i"
+          );
+
+          // Extract the parts after the command specifically looking for --exclude
+          // E.g., @ai-bot /summary --exclude test.lua, *.txt, data/
+          const summaryMatch = commentBody.match(summaryRegex);
+          if (summaryMatch) {
+            triggerSummary = true;
+            commanded = true;
+            const extraArgs = summaryMatch[1]?.trim();
+            if (extraArgs && extraArgs.startsWith("--exclude ")) {
+              excludeFiles = extraArgs
+                .slice(10)
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+
+          const suggestMatch = commentBody.match(suggestRegex);
+          if (suggestMatch) {
+            triggerSuggestion = true;
+            commanded = true;
+            const extraArgs = suggestMatch[1]?.trim();
+            // If both commands are present (unlikely), excludeFiles might be overwritten by the second match
+            if (extraArgs && extraArgs.startsWith("--exclude ")) {
+              excludeFiles = extraArgs
+                .slice(10)
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+
+          if (!commanded) {
+            return request.body; // Not a bot command, do nothing
+          }
         }
 
         typedFastify.log.info(
@@ -302,30 +396,32 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
         const taskIds: string[] = [];
         const enqueuedTasks: string[] = [];
 
-        if (enablePrSummary) {
+        if (triggerSummary) {
           const summaryTaskId = crypto.randomUUID();
           taskQueue.push({
             taskId: summaryTaskId,
             action: "pr_summary",
-            triggerSource: eventType,
+            triggerSource: eventType as string,
             prIndex,
             repoOwner,
             repoName,
+            excludeFiles,
           });
           taskIds.push(summaryTaskId);
           enqueuedTasks.push("AI PR Summary");
         }
 
-        if (enablePrTitleSuggestion) {
+        if (triggerSuggestion) {
           const suggestionTaskId = crypto.randomUUID();
           taskQueue.push({
             taskId: suggestionTaskId,
             action: "pr_title_suggestion",
-            triggerSource: eventType,
+            triggerSource: eventType as string,
             prIndex,
             repoOwner,
             repoName,
             prTitle,
+            excludeFiles,
           });
           taskIds.push(suggestionTaskId);
           enqueuedTasks.push("PR Title Suggestion");

@@ -34,6 +34,13 @@ const ENABLE_PR_SUMMARY = process.env.ENABLE_PR_SUMMARY !== "false";
 const ENABLE_PR_TITLE_SUGGESTION =
   process.env.ENABLE_PR_TITLE_SUGGESTION !== "false";
 
+// Bot command prefix defaults to @ai-bot
+const BOT_COMMAND_PREFIX = process.env.BOT_COMMAND_PREFIX;
+if (!BOT_COMMAND_PREFIX) {
+  console.error("BOT_COMMAND_PREFIX must be set in the environment variables.");
+  process.exit(1);
+}
+
 // Initialize Gitea API client
 const gitea = giteaApi(GITEA_URL, { token: GITEA_TOKEN });
 
@@ -56,6 +63,7 @@ fastify.register(apiRoutes, {
   geminiModel: GEMINI_MODEL,
   enablePrSummary: ENABLE_PR_SUMMARY,
   enablePrTitleSuggestion: ENABLE_PR_TITLE_SUGGESTION,
+  botCommandPrefix: BOT_COMMAND_PREFIX,
 });
 
 // Get and log Gitea version on startup
