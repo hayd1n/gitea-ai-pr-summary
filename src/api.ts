@@ -352,7 +352,7 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
           );
 
           // Extract the parts after the command specifically looking for --exclude
-          // E.g., @ai-bot /summary --exclude test.lua, *.txt, data/
+          // E.g., @ai-bot /summary --exclude `test.lua, *.txt, data/`
           const summaryMatch = commentBody.match(summaryRegex);
           if (summaryMatch) {
             triggerSummary = true;
@@ -361,6 +361,8 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
             if (extraArgs && extraArgs.startsWith("--exclude ")) {
               excludeFiles = extraArgs
                 .slice(10)
+                .trim()
+                .replace(/^`|`$/g, "")
                 .split(",")
                 .map((s) => s.trim())
                 .filter(Boolean);
@@ -376,6 +378,8 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
             if (extraArgs && extraArgs.startsWith("--exclude ")) {
               excludeFiles = extraArgs
                 .slice(10)
+                .trim()
+                .replace(/^`|`$/g, "")
                 .split(",")
                 .map((s) => s.trim())
                 .filter(Boolean);
