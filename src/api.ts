@@ -26,7 +26,7 @@ export interface ApiOptions {
   enablePrSummary?: boolean;
   enablePrTitleSuggestion?: boolean;
   prSummaryCommentUpdateExisting?: boolean;
-  prSummartCommentPrefix?: string;
+  prSummaryCommentPrefix?: string;
   prTitleSuggestionCommentPrefix?: string;
   botCommandPrefix?: string;
 }
@@ -36,7 +36,7 @@ export const ApiOptionsDefaults = {
   enablePrSummary: true,
   enablePrTitleSuggestion: true,
   prSummaryCommentUpdateExisting: true,
-  prSummartCommentPrefix: "AI_PR_SUMMARY",
+  prSummaryCommentPrefix: "AI_PR_SUMMARY",
   prTitleSuggestionCommentPrefix: "AI_PR_TITLE_SUGGESTION",
   botCommandPrefix: "@ai-bot",
 };
@@ -52,7 +52,7 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
     enablePrSummary = ApiOptionsDefaults.enablePrSummary,
     enablePrTitleSuggestion = ApiOptionsDefaults.enablePrTitleSuggestion,
     prSummaryCommentUpdateExisting = ApiOptionsDefaults.prSummaryCommentUpdateExisting,
-    prSummartCommentPrefix = ApiOptionsDefaults.prSummartCommentPrefix,
+    prSummaryCommentPrefix = ApiOptionsDefaults.prSummaryCommentPrefix,
     prTitleSuggestionCommentPrefix = ApiOptionsDefaults.prTitleSuggestionCommentPrefix,
     botCommandPrefix = ApiOptionsDefaults.botCommandPrefix,
   } = options;
@@ -100,7 +100,7 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
           );
 
           // Use a consistent prefix for the comment, optionally with a unique suffix to allow multiple comments if updates are not desired
-          let prefix = prSummartCommentPrefix;
+          let prefix = prSummaryCommentPrefix;
           if (!prSummaryCommentUpdateExisting) {
             prefix += `_${crypto.randomUUID()}`;
           }
