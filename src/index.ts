@@ -45,6 +45,13 @@ const MAX_DIFF_LENGTH_PER_FILE = process.env.MAX_DIFF_LENGTH_PER_FILE
   ? parseInt(process.env.MAX_DIFF_LENGTH_PER_FILE)
   : 150000;
 
+const RETRY_INTERVAL_SECONDS = process.env.RETRY_INTERVAL_SECONDS
+  ? parseInt(process.env.RETRY_INTERVAL_SECONDS) * 1000
+  : 60 * 1000; // default 60 seconds
+const MAX_RETRY_COUNT = process.env.MAX_RETRY_COUNT
+  ? parseInt(process.env.MAX_RETRY_COUNT)
+  : 5;
+
 // Initialize Gitea API client
 const gitea = giteaApi(GITEA_URL, { token: GITEA_TOKEN });
 
@@ -69,6 +76,8 @@ fastify.register(apiRoutes, {
   enablePrTitleSuggestion: ENABLE_PR_TITLE_SUGGESTION,
   botCommandPrefix: BOT_COMMAND_PREFIX,
   maxDiffLengthPerFile: MAX_DIFF_LENGTH_PER_FILE,
+  retryInterval: RETRY_INTERVAL_SECONDS,
+  maxRetryCount: MAX_RETRY_COUNT,
 });
 
 // Get and log Gitea version on startup

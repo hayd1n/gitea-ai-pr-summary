@@ -55,6 +55,8 @@ ENABLE_PR_SUMMARY=true
 ENABLE_PR_TITLE_SUGGESTION=true
 BOT_COMMAND_PREFIX="@ai-bot"   # Default prefix to trigger bot via comments
 MAX_DIFF_LENGTH_PER_FILE=150000 # Max character length per file in git diff before the file is excluded from AI context
+RETRY_INTERVAL_SECONDS=60      # Wait time in seconds before retrying a failed task
+MAX_RETRY_COUNT=5              # Maximum number of retry attempts for failed tasks
 ```
 
 ## Usage
@@ -157,6 +159,19 @@ GET <http://your-server-ip:3000/tasks>
       "repoOwner": "gitea",
       "repoName": "awesome-repo",
       "prTitle": "update readme"
+    }
+  ],
+  "delayedTasksLength": 1,
+  "delayedTasks": [
+    {
+      "taskId": "f9g0h1i2-...",
+      "action": "pr_summary",
+      "triggerSource": "pull_request",
+      "prIndex": 42,
+      "repoOwner": "gitea",
+      "repoName": "awesome-repo",
+      "retryCount": 1,
+      "retryAt": 1718449511000
     }
   ]
 }

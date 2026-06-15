@@ -30,6 +30,8 @@ export interface ApiOptions {
   prTitleSuggestionCommentPrefix?: string;
   botCommandPrefix?: string;
   maxDiffLengthPerFile?: number;
+  retryInterval?: number;
+  maxRetryCount?: number;
 }
 
 export const ApiOptionsDefaults = {
@@ -41,6 +43,8 @@ export const ApiOptionsDefaults = {
   prTitleSuggestionCommentPrefix: "AI_PR_TITLE_SUGGESTION",
   botCommandPrefix: "@ai-bot",
   maxDiffLengthPerFile: 150000,
+  retryInterval: 60 * 1000,
+  maxRetryCount: 5,
 };
 
 export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
@@ -58,6 +62,8 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
     prTitleSuggestionCommentPrefix = ApiOptionsDefaults.prTitleSuggestionCommentPrefix,
     botCommandPrefix = ApiOptionsDefaults.botCommandPrefix,
     maxDiffLengthPerFile = ApiOptionsDefaults.maxDiffLengthPerFile,
+    retryInterval = ApiOptionsDefaults.retryInterval,
+    maxRetryCount = ApiOptionsDefaults.maxRetryCount,
   } = options;
 
   const typedFastify = fastify.withTypeProvider<TypeBoxTypeProvider>();
@@ -73,9 +79,13 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
     repoName: string;
     prTitle?: string;
     excludeFiles?: string[];
+    retryCount?: number;
+    commentPrefix?: string;
+    retryAt?: number;
   }
 
   const taskQueue: PRTask[] = [];
+  const delayedTasks: PRTask[] = [];
 
   let currentProcessingTask: PRTask | null = null;
   let isProcessingQueue = false;
@@ -102,12 +112,18 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
             "Starting PR summary generation task"
           );
 
-          // Use a consistent prefix for the comment, optionally with a unique suffix to allow multiple comments if updates are not desired
-          let prefix = prSummaryCommentPrefix;
-          if (!prSummaryCommentUpdateExisting) {
-            prefix += `_${crypto.randomUUID()}`;
+          let prefix = task.commentPrefix;
+          if (!prefix) {
+            let basePrefix = prSummaryCommentPrefix;
+            if (!prSummaryCommentUpdateExisting) {
+              basePrefix += `_${crypto.randomUUID()}`;
+            }
+            prefix = `<!-- ${basePrefix} -->`; // HTML comment to hide the prefix in the comment body
+            task.commentPrefix = prefix;
           }
-          prefix = `<!-- ${prefix} -->`; // HTML comment to hide the prefix in the comment body
+
+          const currentRetryCount = task.retryCount || 0;
+          const attemptMsg = currentRetryCount > 0 ? ` (Attempt ${currentRetryCount + 1}/${maxRetryCount + 1})` : "";
 
           // Create or update a comment in Gitea to indicate that the summary is being generated
           await createOrUpdateExistingIssueComment(
@@ -116,7 +132,7 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
             repoName,
             prIndex,
             prefix,
-            "> Generating PR summary... (This may take a moment)"
+            `> Generating PR summary${attemptMsg}... (This may take a moment)`
           );
 
           const rawDiff = await getPRDiff(gitea, repoOwner, repoName, prIndex);
@@ -130,8 +146,6 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
             "Fetched PR diff"
           );
 
-          let prSummary = undefined;
-
           // Load prompt and template dynamically
           const summaryPrompt = await getPromptOrTemplate(
             "pr-summary.prompt.txt",
@@ -142,25 +156,13 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
             DEFAULT_PR_SUMMARY_TEMPLATE
           );
 
-          try {
-            prSummary = await generatePRSummary(gemini, diff, {
-              model: geminiModel,
-              prompt: summaryPrompt,
-            });
-          } catch (error) {
-            typedFastify.log.error(
-              { taskId, error },
-              "Failed to generate PR summary"
-            );
-          }
+          const prSummary = await generatePRSummary(gemini, diff, {
+            model: geminiModel,
+            prompt: summaryPrompt,
+          });
 
           if (!prSummary) {
-            typedFastify.log.warn(
-              { taskId },
-              "PR summary generation returned empty result"
-            );
-            prSummary =
-              "Failed to generate PR summary. Please check the logs for details.";
+            throw new Error("PR summary generation returned empty result");
           }
 
           let finalComment = summaryTemplate
@@ -278,6 +280,59 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
         }
       } catch (error) {
         typedFastify.log.error({ taskId, action, error }, "Task failed");
+        
+        if (action === "pr_summary") {
+          const currentRetryCount = task.retryCount || 0;
+          if (currentRetryCount < maxRetryCount) {
+            const nextRetryCount = currentRetryCount + 1;
+            const nextTask: PRTask = { ...task, retryCount: nextRetryCount, retryAt: Date.now() + retryInterval };
+            const prefix = task.commentPrefix || `<!-- ${prSummaryCommentPrefix} -->`;
+            
+            const retryMessage = `> ⚠️ Failed to generate PR summary. Retrying in ${Math.round(retryInterval / 1000)} seconds (Attempt ${nextRetryCount}/${maxRetryCount})...`;
+            
+            try {
+              await createOrUpdateExistingIssueComment(
+                gitea,
+                repoOwner,
+                repoName,
+                prIndex,
+                prefix,
+                retryMessage
+              );
+            } catch (commentError) {
+              typedFastify.log.error({ taskId, commentError }, "Failed to update retry comment");
+            }
+            
+            delayedTasks.push(nextTask);
+            setTimeout(() => {
+              const index = delayedTasks.findIndex((t) => t.taskId === nextTask.taskId);
+              if (index !== -1) {
+                delayedTasks.splice(index, 1);
+              }
+              taskQueue.push(nextTask);
+              processQueue().catch((err) => {
+                typedFastify.log.error({ err }, "Error in processQueue loop");
+              });
+            }, retryInterval);
+            
+            currentProcessingTask = null;
+            continue;
+          } else {
+            const prefix = task.commentPrefix || `<!-- ${prSummaryCommentPrefix} -->`;
+            try {
+              await createOrUpdateExistingIssueComment(
+                gitea,
+                repoOwner,
+                repoName,
+                prIndex,
+                prefix,
+                "> ⚠️ Failed to generate PR summary after multiple attempts. Please check the logs for details."
+              );
+            } catch (e) {
+              typedFastify.log.error({ taskId, error: e }, "Failed to update final failure comment");
+            }
+          }
+        }
       }
 
       currentProcessingTask = null;
@@ -520,6 +575,8 @@ export const apiRoutes: FastifyPluginAsync<ApiOptions> = async (
       currentTask: currentProcessingTask,
       queueLength: taskQueue.length,
       queuedTasks: taskQueue,
+      delayedTasksLength: delayedTasks.length,
+      delayedTasks: delayedTasks,
     };
   });
 };
